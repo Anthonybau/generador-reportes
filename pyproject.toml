@@ -11,3 +11,8 @@ dependencies = [
     "pillow>=12.0.0",
     "pytesseract>=0.3.13",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.1",
+]

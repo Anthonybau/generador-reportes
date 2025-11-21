@@ -6,9 +6,8 @@ import logging
 from logging.handlers import RotatingFileHandler
 import pdfplumber
 import pytesseract
-from PIL import ImageEnhance, ImageFilter, ImageOps
+from PIL import ImageEnhance, ImageFilter
 import pandas as pd
-from datetime import datetime
 
 # --- CONFIGURACIÓN ---
 CARPETA_PDFS = "./documentos_entrada"
@@ -133,7 +132,7 @@ def extraer_texto_con_ocr(ruta_archivo):
 def buscar_titulo_resolucion_exacto(texto):
     cabecera = limpiar_texto_basico(texto[:800])
     patron = (
-        r"(?:N[°ºo\.]?)?\s*(\d{1,5})[\s\._-]*(\d{4})[\s\._-]*(MPH|MP|M.PH|MP-H|MPH/GM)?"
+        r"(?:N[°ºo\.]?)?\s*(\d{1,5})[\s\._-]*(\d{4})[\s\._-]*(MPH/GM|MPH|MP|M.PH|MP-H)?"
     )
     match = re.search(patron, cabecera, re.IGNORECASE)
     if match:
@@ -203,8 +202,8 @@ def extraer_parte_resolutiva(texto):
         return ""
     texto_lineal = re.sub(r"\s+", " ", texto)
     patrones = [
-        r"ART[ÍI]CULO\s+(?:PRIMERO|1[º°]?)\s*[\.\-—]?\s+(?P<c>.+?)(?=\s+(?:ART[ÍI]CULO|REG[ÍI]STRESE|COMUN[ÍI]QUESE|FIRMA))",
-        r"(?:SE\s+)?RESUELVE\s*[:\.]?\s*(?P<c>.+?)(?=\s+(?:ART[ÍI]CULO|REG[ÍI]STRESE|FIRMA))",
+        r"ART[ÍI]CULO\s+(?:PRIMERO|1[º°]?)\s*[\.\-—]*\s+(?P<c>.+?)(?=\s+(?:ART[ÍI]CULO|REG[ÍI]STRESE|COMUN[ÍI]QUESE|FIRMA)|$)",
+        r"(?:SE\s+)?RESUELVE\s*[:\.\-—]*\s+(?P<c>.+?)(?=\s+(?:ART[ÍI]CULO|REG[ÍI]STRESE|FIRMA)|$)",
     ]
     contenido = ""
     for p in patrones:
