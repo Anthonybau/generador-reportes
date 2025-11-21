@@ -1,16 +1,21 @@
+#!/usr/bin/env python3
 import os
 import re
+import sys
+import logging
+from logging.handlers import RotatingFileHandler
 import pdfplumber
 import pytesseract
-from PIL import ImageEnhance
+from PIL import ImageEnhance, ImageFilter, ImageOps
 import pandas as pd
+from datetime import datetime
 
 # --- CONFIGURACIÓN ---
 CARPETA_PDFS = "./documentos_entrada"
 ARCHIVO_SALIDA = "cargaRGM_final.xlsx"
 URL_BASE_STORAGE = "https://tustorage.municipalidad.gob.pe/archivos/"
 
-# RUTA TESSERACT
+# RUTA TESSERACT (ajusta según tu SO)
 pytesseract.pytesseract.tesseract_cmd = r"D:\Programs\Tesseract-OCR\tesseract.exe"
 
 # MAPEOS
@@ -22,204 +27,202 @@ TIPO_PUBLICACION_MAP = {
 }
 CATEGORIA_DEFAULT = 54
 
+# Logging
+LOG_FILE = "procesamiento_pdfs.log"
+logger = logging.getLogger("proc_pdfs")
+logger.setLevel(logging.INFO)
+handler = RotatingFileHandler(
+    LOG_FILE, maxBytes=5_000_000, backupCount=3, encoding="utf-8"
+)
+fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
+handler.setFormatter(fmt)
+logger.addHandler(handler)
+console = logging.StreamHandler(sys.stdout)
+console.setFormatter(fmt)
+logger.addHandler(console)
 
-def limpiar_texto_basico(texto):
+
+def limpiar_texto_basico(texto: str) -> str:
     if not texto:
         return ""
     return re.sub(r"\s+", " ", texto).strip()
 
 
 def preprocesar_imagen_para_handwriting(imagen):
-    """
-    Trucos de imagen para hacer legible el texto a mano:
-    1. Convierte a escala de grises.
-    2. Aumenta el contraste violentamente.
-    3. Convierte a Blanco y Negro puro (Threshold) para engrosar trazos finos.
-    """
-    # 1. Escala de grises
+    """Preprocesado robusto: escala, contraste, mediana, binarización."""
     img = imagen.convert("L")
-
-    # 2. Aumentar contraste (ayuda si el lapicero es azul o negro suave)
+    img = img.filter(ImageFilter.MedianFilter(size=3))
     enhancer = ImageEnhance.Contrast(img)
-    img = enhancer.enhance(2.0)  # Doble de contraste
-
-    # 3. Binarización (Todo lo que no sea blanco puro se vuelve negro absoluto)
-    # El valor 180 es el "umbral". Ajustable entre 100 y 200.
-    # Si el texto a mano es muy claro, sube a 200. Si hay mucho ruido (puntos), baja a 150.
-    fn = lambda x: 255 if x > 160 else 0  # noqa: E731
+    img = enhancer.enhance(2.0)
+    # Invertir si fondo oscuro (opcional) - detecta brillo medio
+    stat = img.point(lambda p: p).getextrema()
+    # binarización con umbral configurado
+    fn = lambda x: 255 if x > 160 else 0
     img = img.point(fn, mode="1")
-
     return img
 
 
 def extraer_texto_con_ocr(ruta_archivo):
-    """
-    Estrategia Mejorada:
-    - Corta solo la CABECERA (25% superior) para buscar el título con filtros agresivos.
-    - Lee el resto normal.
-    """
     texto_completo = ""
     uso_ocr = False
-
     try:
         with pdfplumber.open(ruta_archivo) as pdf:
             for i, pagina in enumerate(pdf.pages):
-                # --- PÁGINA 1: TRATAMIENTO ESPECIAL PARA MANUSCRITOS ---
+                try:
+                    text = pagina.extract_text()
+                except Exception:
+                    text = None
+
+                # Si página 1, aplicar estrategia mixta (cabecera+resto)
                 if i == 0:
-                    uso_ocr = True
+                    # Solo si la página es probable escaneada o texto corto, hacer OCR
+                    if not text or len(text) < 100:
+                        uso_ocr = True
                     try:
-                        # 1. Obtener imagen original de alta calidad
-                        im_original = pagina.to_image(resolution=300).original
-
-                        # 2. Recortar solo la cabecera (Top 25%) para evitar leer basura del pie de página
-                        width, height = im_original.size
-                        im_cabecera = im_original.crop((0, 0, width, height * 0.25))
-
-                        # 3. Aplicar filtros para resaltar escritura a mano
-                        im_procesada = preprocesar_imagen_para_handwriting(im_cabecera)
-
-                        # 4. OCR a la cabecera procesada
-                        # --psm 6: Asume bloque de texto. --oem 1: Neural Net (mejor para algo de manuscrito)
-                        texto_cabecera = pytesseract.image_to_string(
-                            im_procesada, lang="spa", config="--psm 6"
-                        )
-
-                        # 5. OCR al resto de la página (cuerpo) sin filtros agresivos (para leer bien el texto impreso)
-                        im_cuerpo = im_original.crop((0, height * 0.25, width, height))
-                        texto_cuerpo = pytesseract.image_to_string(
-                            im_cuerpo, lang="spa"
-                        )
-
-                        texto_completo += texto_cabecera + "\n" + texto_cuerpo + "\n"
-
-                    except Exception as e_ocr:
-                        print(f"Error OCR pág 1: {e_ocr}")
-                        texto_completo += pagina.extract_text() or ""
+                        img_page = pagina.to_image(resolution=300).original
+                        width, height = img_page.size
+                        # Crop con int
+                        top_h = int(height * 0.25)
+                        im_cabecera = img_page.crop((0, 0, width, top_h))
+                        im_cuerpo = img_page.crop((0, top_h, width, height))
+                        texto_cabecera = ""
+                        try:
+                            im_proc = preprocesar_imagen_para_handwriting(im_cabecera)
+                            texto_cabecera = pytesseract.image_to_string(
+                                im_proc, lang="spa", config="--psm 6 --oem 1"
+                            )
+                        except Exception as e:
+                            logger.debug(f"OCR cabecera fallo: {e}")
+                        texto_cuerpo = ""
+                        try:
+                            texto_cuerpo = pytesseract.image_to_string(
+                                im_cuerpo, lang="spa"
+                            )
+                        except Exception as e:
+                            logger.debug(f"OCR cuerpo fallo: {e}")
+                        # Si extrajo poco, tomar extract_text fallback
+                        if (not texto_cabecera and not texto_cuerpo) and text:
+                            texto_completo += text + "\n"
+                        else:
+                            texto_completo += (
+                                texto_cabecera + "\n" + texto_cuerpo + "\n"
+                            )
+                    except Exception as e:
+                        logger.warning(f"Error OCR página 0 en {ruta_archivo}: {e}")
+                        texto_completo += text or ""
                 else:
-                    # Resto de páginas
-                    texto_pagina = pagina.extract_text()
-                    if texto_pagina and len(texto_pagina) > 50:
-                        texto_completo += texto_pagina + "\n"
+                    # Resto de páginas: preferir extract_text, sino OCR de la página
+                    if text and len(text) > 50:
+                        texto_completo += text + "\n"
                     else:
                         try:
-                            im = pagina.to_image(resolution=300).original
+                            img = pagina.to_image(resolution=300).original
                             texto_completo += (
-                                pytesseract.image_to_string(im, lang="spa") + "\n"
+                                pytesseract.image_to_string(img, lang="spa") + "\n"
                             )
-                        except Exception as e_img:
-                            print(f"Error OCR pág {i}: {e_img}")
-                            texto_completo += pagina.extract_text() or ""
-
+                        except Exception as e:
+                            logger.debug(f"OCR página {i} falló: {e}")
+                            texto_completo += text or ""
     except Exception as e:
-        print(f"Error leyendo archivo {ruta_archivo}: {e}")
+        logger.error(f"Error abriendo {ruta_archivo}: {e}")
         return "", False
 
     return texto_completo, uso_ocr
 
 
 def buscar_titulo_resolucion_exacto(texto):
-    """
-    Busca formato NUMERO - AÑO - MPH en el primer bloque de texto (Cabecera).
-    """
-    # Limitamos la búsqueda a los primeros 500 caracteres para evitar falsos positivos abajo.
     cabecera = limpiar_texto_basico(texto[:800])
-
-    # Regex optimizado:
-    # (\d{1,5}) : Número (manuscrito o impreso)
-    # [\s\._-]* : Separadores flexibles (el OCR a veces lee el guion manuscrito como punto o guion bajo)
-    # (\d{4})   : Año
-    # [\s\._-]*MPH : MPH final
-    patron = r"(?:N[°ºo\.]?)?\s*(\d{1,5})[\s\._-]*(\d{4})[\s\._-]*MPH"
-
+    patron = (
+        r"(?:N[°ºo\.]?)?\s*(\d{1,5})[\s\._-]*(\d{4})[\s\._-]*(MPH|MP|M.PH|MP-H|MPH/GM)?"
+    )
     match = re.search(patron, cabecera, re.IGNORECASE)
     if match:
         numero = match.group(1)
         anio = match.group(2)
-        return f"{numero}-{anio}-MPH/GM"
-
+        sufijo = match.group(3) or "MPH"
+        return f"{numero}-{anio}-{sufijo}".upper()
     return "S/N (Manual)"
 
 
-def buscar_fecha_sello(texto):
-    # Solo buscamos en el encabezado
-    cabecera = texto[:1000]
+def formatear_fecha(dia, mes_txt, anio):
+    try:
+        mes_txt = mes_txt.lower().strip()[:3]
+        meses = {
+            "ene": "01",
+            "jan": "01",
+            "feb": "02",
+            "mar": "03",
+            "abr": "04",
+            "apr": "04",
+            "may": "05",
+            "jun": "06",
+            "jul": "07",
+            "ago": "08",
+            "aug": "08",
+            "set": "09",
+            "sep": "09",
+            "oct": "10",
+            "nov": "11",
+            "dic": "12",
+            "dec": "12",
+        }
+        mes = meses.get(mes_txt, "01")
+        d = str(int(dia)).zfill(2)
+        return f"{d}/{mes}/{anio}"
+    except Exception:
+        return "01/01/1900"
 
+
+def buscar_fecha_sello(texto):
+    # Primero, buscar dd/mm/yyyy
+    m = re.search(r"(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})", texto)
+    if m:
+        d, mth, y = m.groups()
+        return f"{int(d):02d}/{int(mth):02d}/{y}"
+
+    # Buscar formatos escritos (Ayacucho ... 12 de abril de 2024)
+    cabecera = texto[:1000]
     patron = (
-        r"Ayacucho.*?\s+(\d{1,2})\s*(?:de)?\s*([A-Za-z]{3,})\s*(?:de|del)?\s*(\d{4})"
+        r"Ayacucho.*?(\d{1,2})\s*(?:de)?\s*([A-Za-z]{3,})\.?\s*(?:de|del)?\s*(\d{4})"
     )
     match = re.search(patron, cabecera, re.IGNORECASE)
-
     if match:
-        d, m, a = match.groups()
-        return formatear_fecha(d, m, a)
+        return formatear_fecha(*match.groups())
 
-    # Fallback simple
-    patron_simple = r"(\d{1,2})\s*(?:de)?\s*([A-Za-z]{3,})\s*(?:de|del)?\s*(\d{4})"
+    # Fallback: buscar cualquier "12 de abril 2024"
+    patron_simple = r"(\d{1,2})\s*(?:de)?\s*([A-Za-z]{3,})\.?\s*(?:de|del)?\s*(\d{4})"
     match_simple = re.search(patron_simple, cabecera, re.IGNORECASE)
     if match_simple:
-        d, m, a = match_simple.groups()
-        return formatear_fecha(d, m, a)
+        return formatear_fecha(*match_simple.groups())
 
     return "Fecha no detectada"
-
-
-def formatear_fecha(dia, mes_txt, anio):
-    mes_txt = mes_txt.lower().strip()[:3]
-    meses = {
-        "ene": "01",
-        "jan": "01",
-        "feb": "02",
-        "mar": "03",
-        "abr": "04",
-        "apr": "04",
-        "may": "05",
-        "jun": "06",
-        "jul": "07",
-        "ago": "08",
-        "aug": "08",
-        "set": "09",
-        "sep": "09",
-        "oct": "10",
-        "nov": "11",
-        "dic": "12",
-        "dec": "12",
-    }
-    mes = meses.get(mes_txt, "01")
-    return f"{dia.zfill(2)}/{mes}/{anio}"
 
 
 def extraer_parte_resolutiva(texto):
     if not texto:
         return ""
     texto_lineal = re.sub(r"\s+", " ", texto)
-
-    patron = r"ART[ÍI]CULO\s+(?:PRIMERO|1[º°]?)\s*[\.\-—]?\s+(?P<contenido>.+?)(?=\s+(?:[A-ZÑa-z]|\W)?\s*ART[ÍI]CULO\s+SE(?:GUNDO|2)|REG[ÍI]STRESE|COMUN[ÍI]QUESE)"
-    match = re.search(patron, texto_lineal, re.IGNORECASE)
+    patrones = [
+        r"ART[ÍI]CULO\s+(?:PRIMERO|1[º°]?)\s*[\.\-—]?\s+(?P<c>.+?)(?=\s+(?:ART[ÍI]CULO|REG[ÍI]STRESE|COMUN[ÍI]QUESE|FIRMA))",
+        r"(?:SE\s+)?RESUELVE\s*[:\.]?\s*(?P<c>.+?)(?=\s+(?:ART[ÍI]CULO|REG[ÍI]STRESE|FIRMA))",
+    ]
     contenido = ""
-
-    if match:
-        contenido = match.group("contenido")
-    else:
-        patron_fb = r"(?:SE\s+)?RESUELVE\s*[:\.]?\s*(?P<contenido>.+?)(?=\s+(?:[A-ZÑ]|\W)?\s*ART[ÍI]CULO\s+SE(?:GUNDO|2)|REG[ÍI]STRESE)"
-        m_fb = re.search(patron_fb, texto_lineal, re.IGNORECASE)
-        if m_fb:
-            contenido = m_fb.group("contenido")
-
+    for p in patrones:
+        m = re.search(p, texto_lineal, re.IGNORECASE)
+        if m:
+            contenido = m.group("c").strip()
+            break
     if contenido:
         contenido = re.sub(
-            r"^[\W_]*ART[ÍI]CULO\s+(?:PRIMERO|1[º°]?)[\s\.\-—]*",
-            "",
-            contenido,
-            flags=re.IGNORECASE,
+            r"^ART[ÍI]CULO\s+PRIMERO[\s\.\-—]*", "", contenido, flags=re.IGNORECASE
         )
-        contenido = re.sub(r"\s+[A-ZÑa-z]\.?$", "", contenido)
-        return contenido.strip()
-
+        # Limita longitud razonable
+        return contenido[:2000].strip()
     return "Revisar contenido"
 
 
 def determinar_tipo_id(texto):
-    texto_upper = texto.upper()
+    texto_upper = (texto or "").upper()
     for clave, id_tipo in TIPO_PUBLICACION_MAP.items():
         if clave in texto_upper:
             return id_tipo
@@ -227,29 +230,28 @@ def determinar_tipo_id(texto):
 
 
 def procesar_pdfs():
-    if not os.path.exists(CARPETA_PDFS):
-        os.makedirs(CARPETA_PDFS)
-        print(f"Carpeta {CARPETA_PDFS} lista.")
+    carpeta = os.path.abspath(CARPETA_PDFS)
+    if not os.path.exists(carpeta):
+        os.makedirs(carpeta)
+        logger.info(f"Carpeta {carpeta} creada. Coloca los PDFs y vuelve a ejecutar.")
         return
 
-    archivos = [f for f in os.listdir(CARPETA_PDFS) if f.lower().endswith(".pdf")]
+    archivos = [f for f in os.listdir(carpeta) if f.lower().endswith(".pdf")]
     lista_datos = []
-
-    print(f"--- Procesando {len(archivos)} archivos ---")
+    logger.info(f"--- Procesando {len(archivos)} archivos ---")
 
     for archivo in archivos:
-        print(f"-> Analizando: {archivo}")
-        ruta = os.path.join(CARPETA_PDFS, archivo)
-
+        logger.info(f"Analizando: {archivo}")
+        ruta = os.path.join(carpeta, archivo)
         texto_crudo, uso_ocr = extraer_texto_con_ocr(ruta)
         if not texto_crudo:
+            logger.warning(f"No se extrajo texto de {archivo}")
             continue
 
         titulo = buscar_titulo_resolucion_exacto(texto_crudo)
         fecha = buscar_fecha_sello(texto_crudo)
         descripcion = extraer_parte_resolutiva(texto_crudo)
         tipo_id = determinar_tipo_id(texto_crudo)
-
         nombre_norma = limpiar_texto_basico(descripcion)[:200]
 
         fila = {
@@ -264,6 +266,7 @@ def procesar_pdfs():
             "Compendios Normas ids": "",
             "Descripción del documento": f"Documento {titulo}",
             "RUTA TEMP": archivo,
+            "OCR usado": uso_ocr,
         }
         lista_datos.append(fila)
 
@@ -281,12 +284,16 @@ def procesar_pdfs():
             "Compendios Normas ids",
             "Descripción del documento",
             "RUTA TEMP",
+            "OCR usado",
         ]
         df = df.reindex(columns=cols)
-        df.to_excel(ARCHIVO_SALIDA, index=False)
-        print(f"\n✅ EXCEL GENERADO: {ARCHIVO_SALIDA}")
+        try:
+            df.to_excel(ARCHIVO_SALIDA, index=False, engine="openpyxl")
+            logger.info(f"✅ EXCEL GENERADO: {ARCHIVO_SALIDA}")
+        except Exception as e:
+            logger.error(f"Error guardando Excel: {e}")
     else:
-        print("No se encontraron datos.")
+        logger.info("No se encontraron datos.")
 
 
 if __name__ == "__main__":
